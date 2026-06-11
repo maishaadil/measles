@@ -26,7 +26,7 @@ Country fixed effects absorb the between-country MCV1 variation that drives the 
 All five candidate models were trained on 2011-2021 data (4,192 rows) and evaluated on a held-out 2022-2023 test set (768 rows). Temporal ordering is fully preserved; models never see future data during training. This split mirrors the intended prospective use of the predictor and provides a clean, unambiguous estimate of out-of-sample performance for each model.
 
 ## 3. Methodology
-### Five candidate models were estimated and compared: linear regression, lasso, a generalized additive model (GAM), random forest, and SuperLearner. All five models use the same eight features (MCV1, MCV2, log_pop, log_flights, counts_lag1, Year, month, country) so that differences in test MSE reflect differences in model flexibility, not differences in input information.
+Five candidate models were estimated and compared: linear regression, lasso, a generalized additive model (GAM), random forest, and SuperLearner. All five models use the same eight features (MCV1, MCV2, log_pop, log_flights, counts_lag1, Year, month, country) so that differences in test MSE reflect differences in model flexibility, not differences in input information.
 
 ### Linear Regression
 OLS linear regression with country and month as fixed effects serves as the baseline, establishing a performance floor for the comparison. Partial effect estimates for each continuous predictor are shown in Figures 6-9.
