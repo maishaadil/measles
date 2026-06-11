@@ -1,0 +1,817 @@
+---
+title: "European Flights and Measles Incidence: Data Analysis"
+author: "Maisha Adil"
+date: "May 23, 2026"
+output: html_document
+---
+
+## Part 0: Preliminaries
+```{r, message=FALSE, warning=FALSE}
+library(readxl) # Data is in .xlsx format
+library(tidyverse)
+library(visreg) # For partial effect visualization
+library(glmnet)
+library(gam) 
+library(randomForest)
+library(SuperLearner)
+
+# Read in measles.xlsx from EpidemiologicalData > OutputData
+measles <- read_excel("measles.xlsx")
+
+# Read in flights_xxxx.xlsx from FlightPass > OutputData
+flights_2019 <- read_excel("flights_2019.xlsx")
+flights_2020 <- read_excel("flights_2020.xlsx")
+flights_2022 <- read_excel("flights_2022.xlsx")
+```
+
+
+## Part 1: Flight Data Processing
+
+Step 1: Clean the flight data 
+```{r}
+# Rows are origin country, columns are destination country
+clean_flights <- function(flight_df, year) {
+  # Drop the first 2 rows
+  flight_df <- flight_df[-c(1, 2), ]
+  
+  # Drop the 3 identifier columns; keep only the passenger count matrix
+  id_cols <- c("Country_name", "Alpha_3", "Alpha_2")
+  passenger_matrix <- flight_df[, !(names(flight_df) %in% id_cols)]
+  
+  # Convert each column to numeric (lapply produces error for UK)
+  for (j in 1:ncol(passenger_matrix)) {
+    passenger_matrix[[j]] <- as.numeric(passenger_matrix[[j]])
+  }
+  
+  # Total incoming passengers per destination = column sums
+  # na.rm = TRUE treats missing route values as 0 (no recorded flights)
+  incoming <- colSums(passenger_matrix, na.rm = TRUE)
+  
+  # Return a data frame with one row per country
+  data.frame(
+    RegionName = names(incoming),
+    flights    = as.numeric(incoming),
+    Year       = year
+  )
+}
+
+# Apply the function to each year's flight matrix
+flights_2019_clean <- clean_flights(flights_2019, 2019)
+flights_2020_clean <- clean_flights(flights_2020, 2020)
+flights_2022_clean <- clean_flights(flights_2022, 2022)
+```
+
+
+Step 2-3: Impute missing flight years and merge data
+```{r}
+# Step 2: Fill in missing flight years
+
+# We only have observed flight data for 2019, 2020, and 2022
+# The imputation plan is as follows:
+# 2011-2018: use 2019 as a pre-COVID baseline
+# 2019: observed
+# 2020: observed (COVID-suppressed)
+# 2021: average of 2020 and 2022
+# 2022: observed
+# 2023: carry 2022 forward
+
+# Build a country x year grid (32 countries x 13 years = 416 rows)
+all_countries <- sort(unique(measles$RegionName))
+all_years     <- 2011:2023
+
+flights_full  <- expand.grid(
+  RegionName = all_countries,
+  Year       = all_years,
+  stringsAsFactors = FALSE
+)
+flights_full$flights <- NA
+
+# For each year group, match each country name to the corresponding
+# row in the observed data and pull the flights value at that position
+
+# 2011-2019: use 2019 as a pre-COVID baseline
+rows_2011_2019 <- flights_full$Year %in% 2011:2019
+idx <- match(flights_full$RegionName[rows_2011_2019], flights_2019_clean$RegionName)
+flights_full$flights[rows_2011_2019] <- flights_2019_clean$flights[idx]
+
+# 2020: observed
+rows_2020 <- flights_full$Year == 2020
+idx <- match(flights_full$RegionName[rows_2020], flights_2020_clean$RegionName)
+flights_full$flights[rows_2020] <- flights_2020_clean$flights[idx]
+
+# 2021: interpolate as average of 2020 and 2022
+rows_2021 <- flights_full$Year == 2021
+idx_2020 <- match(flights_full$RegionName[rows_2021], flights_2020_clean$RegionName)
+idx_2022 <- match(flights_full$RegionName[rows_2021], flights_2022_clean$RegionName)
+flights_full$flights[rows_2021] <- (flights_2020_clean$flights[idx_2020] +
+                                    flights_2022_clean$flights[idx_2022]) / 2
+
+# 2022 and 2023: use 2022 observed value
+rows_2022_2023 <- flights_full$Year %in% c(2022, 2023)
+idx <- match(flights_full$RegionName[rows_2022_2023], flights_2022_clean$RegionName)
+flights_full$flights[rows_2022_2023] <- flights_2022_clean$flights[idx]
+
+# Check there are no missing flight values after fill-in
+cat("Flight rows still missing after fill-in:", sum(is.na(flights_full$flights)), "\n")
+
+
+# Step 3: Merge flights into the measles panel
+
+# The measles data is monthly, whereas flight data is annual.
+# Each year of flight data attaches to all 12 months of that country.
+
+df <- merge(measles, flights_full, by = c("RegionName", "Year"), all.x = TRUE)
+```
+
+
+## Part 2: Measles Data Processing (Combined Dataset with Flights)
+
+
+Step 1: Impute missing MCV2 values
+```{r}
+# MCV2 (second-dose vaccination coverage) varies by country-year and has 21 missing country-years (252 missing rows in the monthly panel).
+# Two-stage imputation:
+# Stage 1: linear interpolation within country (Finland, Italy, Luxembourg, which are missing only some years)
+# Stage 2: regression imputation using MCV1 + Year (Ireland, which is missing ALL years and cannot be interpolated within-country)
+
+# Work at the country-year level since MCV2 doesn't vary within a year
+mcv2_data <- unique(df[, c("RegionName", "Year", "MCV1", "MCV2")])
+mcv2_data <- mcv2_data[order(mcv2_data$RegionName, mcv2_data$Year), ]
+
+# Flag every row that was originally missing (preserves imputation status even after filling in values)
+mcv2_data$MCV2_imputed <- as.integer(is.na(mcv2_data$MCV2))
+
+
+# Stage 1: Within-Country Linear Interpolation
+
+# Base R's approx() does linear interpolation.
+# rule = 2 means "for years outside the observed range, carry forward the nearest observed value"
+# (constant fill at endpoints, rather than leaving them as NA).
+
+for (ctry in unique(mcv2_data$RegionName)) {
+  rows   <- which(mcv2_data$RegionName == ctry)
+  values <- mcv2_data$MCV2[rows]
+  years  <- mcv2_data$Year[rows]
+  
+  # Skip if all NA (move to Stage 2) or no NA (nothing to impute)
+  if (all(is.na(values))) next
+  if (!any(is.na(values))) next
+  
+  # Interpolate at all years using the non-missing values as anchors
+  interp <- approx(
+    x    = years[!is.na(values)],
+    y    = values[!is.na(values)],
+    xout = years,
+    rule = 2
+  )$y
+  
+  mcv2_data$MCV2[rows] <- interp
+}
+
+
+# Stage 2: Regression Imputation
+
+# Fit MCV2 ~ MCV1 + Year on the country-years where MCV2 is now non-NA 
+# (i.e. originally observed PLUS Stage-1 interpolated).
+# Then predict MCV2 for the remaining missing rows (Ireland).
+mcv2_data$Year <- as.integer(mcv2_data$Year)
+mcv2_model <- lm(MCV2 ~ MCV1 + Year, data = mcv2_data)
+
+cat("\nMCV2 imputation regression coefficients:\n")
+print(round(summary(mcv2_model)$coefficients, 4))
+cat("R-squared:", round(summary(mcv2_model)$r.squared, 3),
+    "| Residual SD:", round(summary(mcv2_model)$sigma, 2), "pp\n")
+
+# Predict for any rows still NA after Stage 1 (i.e. Ireland's 13 rows)
+still_missing <- is.na(mcv2_data$MCV2)
+mcv2_data$MCV2[still_missing] <- round(
+  predict(mcv2_model, newdata = mcv2_data[still_missing, ]),
+  1
+)
+
+# Merge imputed MCV2 and the imputation flag back into the main panel.
+# First drop the original MCV2 column to avoid a name conflict.
+df$MCV2 <- NULL
+df <- merge(
+  df,
+  mcv2_data[, c("RegionName", "Year", "MCV2", "MCV2_imputed")],
+  by   = c("RegionName", "Year"),
+  all.x = TRUE
+)
+```
+
+
+Step 2-3: Compute lagged case counts and reorganize file
+```{r}
+# Step 2: One-month lagged case counts
+
+# This feature captures epidemic momentum. If cases were high last month, they are often elevated this month due to ongoing transmission.
+# January 2011 has no prior month, so the first observation per country will have NA for counts_lag1.
+# Keep these NAs and drop them only at the modeling step (and only for models that use this feature).
+
+# Sort by country and time so the previous row really is the previous month
+df <- df[order(df$RegionName, df$Time), ]
+df$counts_lag1 <- NA
+
+for (ctry in unique(df$RegionName)) {
+  rows <- which(df$RegionName == ctry)
+  # The lag at each row (except the first) is the previous row's cases
+  df$counts_lag1[rows[-1]] <- df$Counts[rows[-length(rows)]]
+}
+
+
+# Step 3: Reorganize file with imputed data
+
+# Extract the numeric month from "2011-01"-style strings
+df$month <- as.integer(substr(df$Time, 6, 7))
+
+# Rename for clarity
+names(df)[names(df) == "RegionName"] <- "country"
+names(df)[names(df) == "Counts"]     <- "cases"
+names(df)[names(df) == "Pop_tot"]    <- "pop"
+names(df)[names(df) == "Time"]       <- "month_str"
+
+# Keep the columns we need in a sensible order
+df <- df[, c("country", "Alpha3", "Year", "month", "month_str",
+             "cases", "pop", "MCV1", "MCV2", "MCV2_imputed",
+             "flights", "counts_lag1")]
+
+# Confirm that no issues persist
+cat(paste0("Final dataset: ", nrow(df), " rows x ", ncol(df), " columns\n"))
+cat(paste0("MCV2 imputed: ", sum(mcv2_data$MCV2_imputed), " of 416 country-years (",
+           sum(mcv2_data$MCV2_imputed) * 12, " monthly rows)\n"))
+
+cat("\nColumns with any missing values:\n")
+missing_counts <- sapply(df, function(x) sum(is.na(x)))
+print(missing_counts[missing_counts > 0])
+print(head(df))
+```
+
+
+## Part 3: Exploratory Data Analysis
+```{r}
+# Two-tone palette used across the section
+burgundy  <- "#5f0a30"
+green <- "#06402b"
+
+
+# Step 1: Summary statistics and skewness
+
+key_vars <- c("cases", "pop", "MCV1", "MCV2", "flights", "counts_lag1")
+summary(df[, key_vars])
+
+# Skewness numbers to motivate the log transform decision (Part 3+)
+skewness_simple <- function(x) {
+  x <- x[!is.na(x)]
+  mean(((x - mean(x)) / sd(x))^3)
+}
+cat(paste0("Skewness (raw cases):      ", round(skewness_simple(df$cases), 2), "\n"))
+cat(paste0("Skewness (log(cases + 1)): ", round(skewness_simple(log(df$cases + 1)), 2), "\n"))
+
+# Zero-inflation
+n_zero <- sum(df$cases == 0)
+cat(paste0("Zero-case country-months: ", n_zero, " of ", nrow(df),
+           " (", round(100 * n_zero / nrow(df), 1), "%)\n"))
+
+
+# Step 2: Distribution of monthly cases
+
+# Figure 1: Distribution of raw monthly measles cases
+ggplot(df, aes(x = cases)) +
+  geom_histogram(bins = 50, fill = burgundy, color = "white") +
+  labs(title = "Figure 1. Distribution of Monthly Measles Cases (Raw)",
+       x = "Monthly Cases Per country",
+       y = "Number of Country-Months") +
+  theme_minimal()
+
+# Figure 2: Distribution of log(cases + 1)
+ggplot(df, aes(x = log(cases + 1))) +
+  geom_histogram(bins = 40, fill = burgundy, color = "white") +
+  labs(title = "Figure 2. Distribution of log(Cases + 1) for Comparison",
+       x = "log(Monthly Cases + 1)",
+       y = "Number of Country-Months") +
+  theme_minimal()
+
+
+# Step 3: Distribution of vaccination coverage
+
+# MCV1 and MCV2 vary only by country-year, so de-duplicate first
+mcv_by_cy <- unique(df[, c("country", "Year", "MCV1", "MCV2")])
+
+# Figure 3: Distribution of MCV1 first-dose coverage across country-years
+ggplot(mcv_by_cy, aes(x = MCV1)) +
+  geom_histogram(bins = 30, fill = green, color = "white") +
+  geom_vline(xintercept = 95, color = "darkgrey", linetype = "dashed", linewidth = 0.6) +
+  annotate("text", x = 94, y = Inf, label = "95% threshold",
+           color = "darkgrey", hjust = 1, vjust = 1.5, size = 3) +
+  labs(title = "Figure 3. Distribution of MCV1 Coverage (Country-Years)",
+       x = "MCV1 First-Dose Coverage (%)",
+       y = "Number of Country-Years") +
+  theme_minimal()
+
+# Figure 4: Distribution of MCV2 second-dose coverage across country-years
+ggplot(mcv_by_cy, aes(x = MCV2)) +
+  geom_histogram(bins = 30, fill = green, color = "white") +
+  geom_vline(xintercept = 95, color = "darkgrey", linetype = "dashed", linewidth = 0.6) +
+  annotate("text", x = 94, y = Inf, label = "95% threshold",
+           color = "darkgrey", hjust = 1, vjust = 1.5, size = 3) +
+  labs(title = "Figure 4. Distribution of MCV2 Coverage (Country-Years)",
+       x = "MCV2 Second-Dose Coverage (%)",
+       y = "Number of Country-Years") +
+  theme_minimal()
+
+
+# Step 4: Monthly cases by country, 2011-2023
+
+df$date <- as.Date(paste0(df$month_str, "-01"))
+
+# Figure 5: Monthly measles cases by country, 2011-2023
+ggplot(df, aes(x = date, y = cases, group = country)) +
+  geom_line(alpha = 0.4, color = burgundy, linewidth = 0.4) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Figure 5. Monthly Measles Cases by Country (n=32), 2011-2023",
+       x = "Year",
+       y = "Monthly Cases") +
+  theme_minimal()
+```
+
+
+## Part 4: Candidate Model 1: Linear Regression
+
+Shared Setup
+```{r}
+# Derived log columns
+df$log_cases   <- log(df$cases + 1)
+df$log_pop     <- log(df$pop)
+df$log_flights <- log(df$flights + 1)
+
+# Factor coercions
+df$country <- as.factor(df$country)
+df$month   <- as.factor(df$month)
+df$Year    <- as.numeric(df$Year)
+
+# Drop lag-NA rows (Jan 2011 per country); use df_model throughout Parts 4-9
+df_model <- df[!is.na(df$counts_lag1), ]
+
+# Temporal train/test split: train on 2011-2021, hold out 2022-2023 as test set.
+# The approach preserves temporal ordering, so models never see future data during training.
+df_train <- df_model[df_model$Year <= 2021, ]
+df_test  <- df_model[df_model$Year >= 2022, ]
+
+cat(paste0("Training set: ", nrow(df_train), " rows (", min(df_train$Year), "-", max(df_train$Year), ")\n"))
+cat(paste0("Test set: ", nrow(df_test), " rows (", min(df_test$Year), "-", max(df_test$Year), ")\n"))
+```
+
+
+Linear Regression Predictor
+```{r}
+# Outcome: log(cases + 1)
+# log_flights is included for a consistent feature set across all five models.
+# Its coefficient is identified by COVID-era within-country variation (2020 dip,
+# 2021 recovery), which confounds flight volume with broader pandemic disruptions.
+# Do not interpret causally; see RF variable importance in Part 7.
+lm_formula <- as.formula(
+  "log_cases ~ MCV1 + MCV2 + log_pop + log_flights + counts_lag1 + Year + month + country"
+)
+
+# Fit on training set; evaluate on held-out test set
+lm_fit_train <- lm(lm_formula, data = df_train)
+lm_test_pred <- predict(lm_fit_train, newdata = df_test)
+lm_test_mse  <- mean((df_test$log_cases - lm_test_pred)^2)
+cat(paste0("Linear regression - Test MSE (2022-2023): ", round(lm_test_mse, 4), "\n"))
+
+# Refit on full dataset for interpretation and plots
+lm_fit_full <- lm(lm_formula, data = df_model)
+summary(lm_fit_full)
+```
+
+
+Linear Regression Plots
+```{r}
+# Figure 6: Partial effect of MCV1 on log(cases + 1) - linear regression
+visreg(lm_fit_full, "MCV1",
+       ylab = "log(cases + 1)", xlab = "MCV1 coverage (%)",
+       main = "Figure 6. Partial Effect of MCV1: Linear Regression",
+       gg = FALSE)
+
+# Figure 7: Partial effect of MCV2 on log(cases + 1) - linear regression
+visreg(lm_fit_full, "MCV2",
+       ylab = "log(cases + 1)", xlab = "MCV2 coverage (%)",
+       main = "Figure 7. Partial Effect of MCV2: Linear Regression",
+       gg = FALSE)
+
+# Figure 8: Partial effect of prior month cases on log(cases + 1) - linear regression
+visreg(lm_fit_full, "counts_lag1",
+       ylab = "log(cases + 1)", xlab = "Prior month cases",
+       main = "Figure 8. Partial Effect of Prior Month Cases: Linear Regression",
+       gg = FALSE)
+
+# Figure 9: Partial effect of log_flights on log(cases + 1) - linear regression
+# Note: not causally interpretable
+visreg(lm_fit_full, "log_flights",
+       ylab = "log(cases + 1)", xlab = "log(incoming passengers + 1)",
+       main = "Figure 9. Partial Effect of Flight Volume: Linear Regression",
+       gg = FALSE)
+```
+
+
+## Part 5: Candidate Model 2: Regularized Methods (Lasso)
+
+Lasso Predictor
+```{r}
+# glmnet requires a numeric matrix; expand factors with model.matrix()
+# model.matrix() drops the intercept column; glmnet adds its own 
+# Factor levels for country and month are identical across df_train and df_test
+# (inherited from df_model), so both matrices have the same column set.
+
+X_train_lasso <- model.matrix(~ MCV1 + MCV2 + log_pop + log_flights + counts_lag1 + Year + month + country,
+                                data = df_train)[, -1]
+y_train_lasso <- df_train$log_cases
+
+X_test_lasso  <- model.matrix(~ MCV1 + MCV2 + log_pop + log_flights + counts_lag1 + Year + month + country,
+                                data = df_test)[, -1]
+y_test_lasso  <- df_test$log_cases
+
+# Lambda selected via cv.glmnet on training data only (internal tuning, not evaluation)
+set.seed(24)
+cv_fit_train  <- cv.glmnet(X_train_lasso, y_train_lasso, alpha = 1, nfolds = 10)
+
+# Predict on held-out test set using lambda.min
+lasso_test_pred <- predict(cv_fit_train, newx = X_test_lasso, s = "lambda.min")
+lasso_test_mse  <- mean((y_test_lasso - lasso_test_pred)^2)
+cat(paste0("Lasso - Test MSE (2022-2023): ", round(lasso_test_mse, 4), "\n"))
+
+# Refit on full dataset for coefficient interpretation and plots
+X_full <- model.matrix(~ MCV1 + MCV2 + log_pop + log_flights + counts_lag1 + Year + month + country,
+                         data = df_model)[, -1]
+y_full         <- df_model$log_cases
+cv_fit_full    <- cv.glmnet(X_full, y_full, alpha = 1, nfolds = 10)
+lasso_fit_full <- glmnet(X_full, y_full, alpha = 1, lambda = cv_fit_full$lambda.min)
+
+# Non-zero coefficients (excluding country and month dummies for clarity)
+# coef() on a glmnet object returns a sparse matrix; as.matrix() converts it
+# to a standard matrix so it can be put into a data frame below
+coefs <- as.matrix(coef(lasso_fit_full))
+coefs_df <- data.frame(
+  variable = rownames(coefs),
+  coefficient = as.numeric(coefs)
+)
+coefs_df <- coefs_df[coefs_df$coefficient != 0, ]
+coefs_df <- coefs_df[!grepl("^country|^month", coefs_df$variable), ]
+print(coefs_df[order(abs(coefs_df$coefficient), decreasing = TRUE), ])
+```
+
+
+Lasso Plots
+```{r}
+# visreg does not work directly with glmnet, so plot coefficients manually
+
+# Extract all non-zero coefficients except intercept, country, and month dummies
+coefs_plot <- coefs_df[coefs_df$variable != "(Intercept)", ]
+
+# Sort once so barplot, names, and colors all use the same order
+coefs_plot <- coefs_plot[order(coefs_plot$coefficient), ]
+
+# Figure 10: Lasso non-zero coefficients (excluding country and month indicators)
+ggplot(coefs_plot, aes(x = coefficient, y = reorder(variable, coefficient),
+                        fill = coefficient > 0)) +
+  geom_bar(stat = "identity") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_fill_manual(values = c("TRUE" = "#06402b", "FALSE" = "#5f0a30"),
+                    guide = "none") +
+  labs(title = "Figure 10. Lasso: Non-Zero Coefficients (Excluding Country/Month Indicators)",
+       x = "Coefficient Value",
+       y = NULL) +
+  theme_minimal()
+```
+
+
+## Part 6: Candidate Model 3: Generalized Additive Models
+
+GAM Predictor
+```{r}
+# MCV1 and MCV2 are entered as linear terms rather than smooth terms.
+# An initial GAM with smooth terms performed worse than OLS during development.
+# Country fixed effects absorb the between-country MCV1 variation that drives the visible 
+# herd-immunity threshold in raw data; within-country changes over time are too small
+# to reveal a threshold nonlinearity after conditioning on country. 
+
+# log_flights included for a consistent feature set across all five models.
+# As in Part 4, the coefficient is confounded by COVID-era disruptions and should not be interpreted causally. 
+gam_formula <- as.formula(
+  "log_cases ~ MCV1 + MCV2 + log_pop + log_flights + counts_lag1 + Year + month + country"
+)
+
+# Fit on training set; evaluate on held-out test set
+gam_fit_train <- gam(gam_formula, data = df_train)
+gam_test_pred <- predict(gam_fit_train, newdata = df_test)
+gam_test_mse  <- mean((df_test$log_cases - gam_test_pred)^2)
+cat(paste0("GAM - Test MSE (2022-2023): ", round(gam_test_mse, 4), "\n"))
+
+# Refit on full dataset for interpretation and plots
+gam_fit_full <- gam(gam_formula, data = df_model)
+summary(gam_fit_full)
+```
+
+
+GAM Plots
+```{r}
+# Figure 11: Partial effect of MCV1 on log(cases + 1) - GAM
+visreg(gam_fit_full, "MCV1",
+       ylab = "log(cases + 1)", xlab = "MCV1 coverage (%)",
+       main = "Figure 11. Partial Effect of MCV1: GAM",
+       gg = FALSE)
+
+# Figure 12: Partial effect of MCV2 on log(cases + 1) - GAM
+visreg(gam_fit_full, "MCV2",
+       ylab = "log(cases + 1)", xlab = "MCV2 coverage (%)",
+       main = "Figure 12. Partial Effect of MCV2: GAM",
+       gg = FALSE)
+
+# Figure 13: Partial effect of prior month cases on log(cases + 1) - GAM
+visreg(gam_fit_full, "counts_lag1",
+       ylab = "log(cases + 1)", xlab = "Prior month cases",
+       main = "Figure 13. Partial Effect of Prior Month Cases: GAM",
+       gg = FALSE)
+
+# Figure 14: Partial effect of log_flights on log(cases + 1) - GAM
+# Note: not causally interpretable; see Section 3
+visreg(gam_fit_full, "log_flights",
+       ylab = "log(cases + 1)", xlab = "log(incoming passengers + 1)",
+       main = "Figure 14. Partial Effect of Flight Volume: GAM",
+       gg = FALSE)
+```
+
+
+## Part 7: Candidate Model 4: Random Forest
+
+Training Dataset
+```{r}
+# Feature matrix and outcome; log_flights included since RF handles collinearity naturally
+# and the training set now provides within-country variation in flight volume
+features_rf <- c("MCV1", "MCV2", "log_pop", "log_flights", "counts_lag1", "Year", "month", "country")
+
+# Feature matrices for training and test sets
+X_train_rf <- df_train[, features_rf]
+y_train_rf <- df_train$log_cases
+X_test_rf  <- df_test[, features_rf]
+y_test_rf  <- df_test$log_cases
+
+# Tune mtry on training data only using OOB error
+# Avoids optimistic bias from tuning on data used for evaluation
+set.seed(24)
+tune_train <- tuneRF(
+  x          = X_train_rf,
+  y          = y_train_rf,
+  mtryStart  = floor(ncol(X_train_rf) / 3),
+  ntreeTry   = 500,
+  stepFactor = 1.5,
+  improve    = 0.01,
+  trace      = FALSE,
+  plot       = FALSE
+)
+best_mtry_train <- tune_train[which.min(tune_train[, 2]), 1]
+cat(paste0("Best mtry (training data): ", best_mtry_train, "\n"))
+
+# Fit RF on training set; evaluate on held-out test set
+set.seed(24)
+rf_fit_train <- randomForest(
+  x      = X_train_rf,
+  y      = y_train_rf,
+  ntree  = 500,
+  mtry   = best_mtry_train
+)
+
+rf_test_pred <- predict(rf_fit_train, newdata = X_test_rf)
+rf_test_mse  <- mean((y_test_rf - rf_test_pred)^2)
+cat(paste0("Random Forest - Test MSE (2022-2023): ", round(rf_test_mse, 4), "\n"))
+```
+
+
+Full Dataset
+```{r}
+# Fit final RF on full dataset for variable importance
+# X_rf and y_rf are also reused by Part 8's full-data SuperLearner fit
+X_rf <- df_model[, features_rf]
+y_rf <- df_model$log_cases
+
+set.seed(24)
+tune_full <- tuneRF(
+  x          = X_rf,
+  y          = y_rf,
+  mtryStart  = floor(ncol(X_rf) / 3),
+  ntreeTry   = 500,
+  stepFactor = 1.5,
+  improve    = 0.01,
+  trace      = FALSE,
+  plot       = FALSE
+)
+best_mtry_full <- tune_full[which.min(tune_full[, 2]), 1]
+cat(paste0("Best mtry (full data): ", best_mtry_full, "\n"))
+
+set.seed(24)
+rf_fit_full <- randomForest(
+  x          = X_rf,
+  y          = y_rf,
+  ntree      = 500,
+  mtry       = best_mtry_full,
+  importance = TRUE  # Required for varImpPlot
+)
+
+# Variable importance plot using permutation-based %IncMSE (type = 1)
+# More reliable than node purity (type = 2) when predictors are correlated,
+# as it directly measures prediction error increase when a feature is shuffled.
+# Figure 15: Random forest feature importance (%IncMSE, permutation-based)
+varImpPlot(rf_fit_full, type = 1, main = "Figure 15. Random Forest: Feature Importance (%IncMSE)")
+```
+
+
+## Part 8: Candidate Model 5: SuperLearner
+
+SuperLearner Setup
+```{r}
+# Custom RF wrapper fixing mtry at the tuned value from Part 7
+# Allows SL to compare default vs tuned RF as distinct candidates
+SL.rf_mtry2 <- function(...) SL.randomForest(..., mtry = 2)
+
+# Helper used by both the training wrapper and the predict method below
+.gam_convert_factors <- function(df) {
+  factor_cols <- sapply(df, is.factor)
+  if (any(factor_cols))
+    df[, factor_cols] <- lapply(df[, factor_cols], as.numeric)
+  df
+}
+
+# Training wrapper: converts factor columns to integer level codes before SL.gam sees them.
+# as.numeric() on a factor gives codes 1, 2, 3, ... for any factor regardless of label.
+# Do NOT use as.numeric(as.character()): that produces NA for non-numeric labels like country names.
+# The fit object is re-classed to "SL.gam_numeric" so that predict.SuperLearner
+# dispatches to predict.SL.gam_numeric (below) rather than predict.SL.gam.
+SL.gam_numeric <- function(Y, X, newX, family, obsWeights, ...) {
+  result <- SL.gam(Y = Y, X = .gam_convert_factors(X),
+                   newX = .gam_convert_factors(newX),
+                   family = family, obsWeights = obsWeights, ...)
+  class(result$fit) <- "SL.gam_numeric"
+  result
+}
+
+# Predict method: mirrors the factor conversion so that post-training calls to
+# predict(sl_fit_train, newdata = X_SL_test) work correctly.
+# object$object is the stored gam model object (same structure as predict.SL.gam).
+predict.SL.gam_numeric <- function(object, newdata, ...) {
+  predict(object$object, newdata = .gam_convert_factors(newdata), type = "response")
+}
+
+# Candidate library
+# create.Learner generates three glmnet wrappers across alpha values:
+# alpha = 0 (ridge), alpha = 0.5 (elastic net), alpha = 1 (lasso)
+enet <- create.Learner("SL.glmnet", detailed_names = TRUE,
+                       tune = list(alpha = c(0, 0.5, 1)))
+
+sl_lib <- c(
+  "SL.mean",           # 1. Intercept-only baseline
+  "SL.lm",             # 2. Linear regression (mirrors Part 4)
+  enet$names,          # 3-5. Ridge, elastic net, lasso (mirrors Part 5)
+  "SL.gam_numeric",    # 6. GAM with numeric month coercion (mirrors Part 6)
+  "SL.randomForest",   # 7. Random forest with default mtry
+  "SL.rf_mtry2"        # 8. Random forest with tuned mtry = 2 (mirrors Part 7)
+)
+```
+
+
+SuperLearner Train/Test
+```{r}
+# Train/test matrices (reuse features_rf from Part 7)
+X_SL_train <- df_train[, features_rf]
+y_SL_train <- df_train$log_cases
+X_SL_test  <- df_test[, features_rf]
+y_SL_test  <- df_test$log_cases
+
+# Fit SuperLearner on training data
+# Inner 10-fold CV is used only for ensemble weight selection within the training set;
+# it does not determine the reported test MSE
+set.seed(24)
+sl_fit_train <- SuperLearner(
+  Y          = y_SL_train,
+  X          = X_SL_train,
+  SL.library = sl_lib,
+  family     = gaussian(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 10)
+)
+
+# Ensemble weights from the training fit
+sl_fit_train
+
+# Predict on held-out test set; compute test MSE
+sl_test_pred <- predict(sl_fit_train, newdata = X_SL_test)$pred
+sl_test_mse  <- mean((y_SL_test - sl_test_pred)^2)
+cat(paste0("SuperLearner - Test MSE (2022-2023): ", round(sl_test_mse, 4), "\n"))
+```
+
+
+SuperLearner Full Dataset
+```{r}
+# Fit final SuperLearner on full dataset for ensemble weight interpretation
+# X_rf and y_rf defined in Part 7 Full Dataset
+set.seed(24)
+sl_fit_full <- SuperLearner(
+  Y          = y_rf,
+  X          = X_rf,
+  SL.library = sl_lib,
+  family     = gaussian(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 10)
+)
+
+# Print ensemble weights; candidates with weight = 0 were outperformed
+# and not selected by the non-negative least squares optimizer
+sl_fit_full
+```
+
+
+## Part 9: Model Evaluation
+
+Model Comparison
+```{r}
+# Summary of 2022-2023 holdout test MSE across all five candidate models
+model_comparison <- data.frame(
+  Model     = c("Linear Regression", "Lasso", "GAM", "Random Forest", "SuperLearner"),
+  Test_MSE  = c(lm_test_mse, lasso_test_mse, gam_test_mse, rf_test_mse, sl_test_mse),
+  Test_RMSE = sqrt(c(lm_test_mse, lasso_test_mse, gam_test_mse, rf_test_mse, sl_test_mse))
+)
+model_comparison$Test_MSE  <- round(model_comparison$Test_MSE, 4)
+model_comparison$Test_RMSE <- round(model_comparison$Test_RMSE, 4)
+
+print(model_comparison)
+```
+
+
+Plot Setup
+```{r}
+# Use test set predictions already computed in Part 7
+rf_eval <- data.frame(
+  observed  = y_test_rf,
+  predicted = rf_test_pred,
+  country   = df_test$country,
+  Year      = df_test$Year
+)
+```
+
+
+Predicted vs Observed
+```{r}
+# Figure 16: Random forest predicted vs. observed log(cases + 1), 2022-2023 holdout
+# 45-degree reference line indicates perfect prediction
+# Points above the line are underpredicted; points below are overpredicted
+ggplot(rf_eval, aes(x = predicted, y = observed)) +
+  geom_point(alpha = 0.3, color = "#5f0a30", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "Figure 16. Random Forest: Predicted vs Observed",
+       subtitle = "2022-2023 Holdout Test Predictions",
+       x = "Predicted log(cases + 1)",
+       y = "Observed log(cases + 1)") +
+  theme_minimal()
+```
+
+
+Bland-Altman Plot
+```{r}
+# Figure 17: Random forest Bland-Altman plot, 2022-2023 holdout
+# x-axis: mean of predicted and observed (average magnitude)
+# y-axis: predicted minus observed (signed error; positive = over-prediction)
+# Mean difference (bias) and limits of agreement (+/- 1.96 SD) are shown
+
+rf_eval$ba_mean <- (rf_eval$predicted + rf_eval$observed) / 2
+rf_eval$ba_diff <- rf_eval$predicted - rf_eval$observed
+
+bias <- mean(rf_eval$ba_diff)
+sd_diff <- sd(rf_eval$ba_diff)
+loa_upper <- bias + 1.96 * sd_diff
+loa_lower <- bias - 1.96 * sd_diff
+
+cat(paste0("Mean difference (bias): ", round(bias, 4), "\n"))
+cat(paste0("Upper limit of agreement: ", round(loa_upper, 4), "\n"))
+cat(paste0("Lower limit of agreement: ", round(loa_lower, 4), "\n"))
+
+ggplot(rf_eval, aes(x = ba_mean, y = ba_diff)) +
+  geom_point(alpha = 0.3, color = "#5f0a30", size = 0.8) +
+  geom_hline(yintercept = bias, color = "#06402b", linetype = "solid", linewidth = 0.7) +
+  geom_hline(yintercept = loa_upper, color = "grey40", linetype = "dashed", linewidth = 0.7) +
+  geom_hline(yintercept = loa_lower, color = "grey40", linetype = "dashed", linewidth = 0.7) +
+  annotate("text", x = max(rf_eval$ba_mean), y = bias,
+           label = sprintf("Bias = %.3f", bias),
+           hjust = 1, vjust = -0.5, size = 3, color = "#06402b") +
+  annotate("text", x = max(rf_eval$ba_mean), y = loa_upper,
+           label = sprintf("+1.96 SD = %.3f", loa_upper),
+           hjust = 1, vjust = -0.5, size = 3, color = "grey40") +
+  annotate("text", x = max(rf_eval$ba_mean), y = loa_lower,
+           label = sprintf("-1.96 SD = %.3f", loa_lower),
+           hjust = 1, vjust = 1.5, size = 3, color = "grey40") +
+  labs(title = "Figure 17. Random Forest: Bland-Altman Plot",
+       subtitle = "2022-2023 Holdout Test Predictions",
+       x = "Mean of Predicted and Observed log(cases + 1)",
+       y = "Predicted Minus Observed log(cases + 1)") +
+  theme_minimal()
+```
+
