@@ -1,4 +1,4 @@
-# measles
+# European Flights and Measles Incidence: Data Analysis
 
 ## 1. Intended Use of the Predictor
 This predictor is designed as a prospective surveillance tool for national public health agencies and the European Centre for Disease Prevention and Control (ECDC). Given a country’s MMR vaccination coverage, incoming air travel volume, and the prior month’s confirmed case count, the model forecasts monthly measles incidence at the country level.
